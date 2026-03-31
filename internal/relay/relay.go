@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,12 +17,52 @@ import (
 	"github.com/bestruirui/octopus/internal/relay/balancer"
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/transformer/inbound"
+	openaiInbound "github.com/bestruirui/octopus/internal/transformer/inbound/openai"
 	"github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/gin-gonic/gin"
 	"github.com/tmaxmax/go-sse"
 )
+
+// ErrClientInputError 表示上游返回的客户端输入错误（422 或格式错误的 400），不触发熔断和 Key 状态更新
+var ErrClientInputError = fmt.Errorf("client input error")
+
+// isClientInputError 判断 400 响应体是否属于客户端输入错误（而非服务器错误）
+// 优先解析结构化 JSON 错误字段，关键字匹配仅作兜底
+func isClientInputError(body string) bool {
+	var errResp struct {
+		Error *struct {
+			Type  string `json:"type"`
+			Code  any    `json:"code"`
+			Param any    `json:"param"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &errResp) == nil && errResp.Error != nil {
+		return errResp.Error.Type != "" || errResp.Error.Code != nil || errResp.Error.Param != nil
+	}
+	// 兜底：关键字匹配（仅用明确的客户端错误标识符）
+	lowerBody := strings.ToLower(body)
+	for _, keyword := range []string{"invalid_request", "invalid_parameter"} {
+		if strings.Contains(lowerBody, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// 透传响应头时需要跳过的 hop-by-hop 头
+var hopByHopResponseHeaders = map[string]bool{
+	"connection":          true,
+	"keep-alive":         true,
+	"proxy-authenticate": true,
+	"proxy-authorization": true,
+	"te":                 true,
+	"trailer":            true,
+	"transfer-encoding":  true,
+	"upgrade":            true,
+	"content-length":     true, // 已写入，透传可能导致问题
+}
 
 // Handler 处理入站请求并转发到上游服务
 func Handler(inboundType inbound.InboundType, c *gin.Context) {
@@ -118,6 +160,10 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			iter.Skip(channel.ID, usedKey.ID, channel.Name, "channel type not compatible with embedding request")
 			continue
 		}
+		if internalRequest.IsResponseCompactRequest() && !outbound.IsCompactChannelType(channel.Type) {
+			iter.Skip(channel.ID, usedKey.ID, channel.Name, "channel type not compatible with responses compact request")
+			continue
+		}
 		if internalRequest.IsChatRequest() && !outbound.IsChatChannelType(channel.Type) {
 			iter.Skip(channel.ID, usedKey.ID, channel.Name, "channel type not compatible with chat request")
 			continue
@@ -190,6 +236,20 @@ func (ra *relayAttempt) attempt() attemptResult {
 	}
 
 	// ====== 失败 ======
+	// 客户端输入错误：响应已透传，不触发熔断和 Key 状态更新（通道失败统计仍会记录）
+	if errors.Is(fwdErr, ErrClientInputError) {
+		span.End(dbmodel.AttemptFailed, statusCode, fwdErr.Error())
+		written := ra.c.Writer.Written()
+		if written {
+			ra.collectResponse()
+		}
+		return attemptResult{
+			Success: false,
+			Written: written,
+			Err:     fwdErr,
+		}
+	}
+
 	op.ChannelKeyUpdate(ra.usedKey)
 	span.End(dbmodel.AttemptFailed, statusCode, fwdErr.Error())
 
@@ -222,9 +282,17 @@ func parseRequest(inboundType inbound.InboundType, c *gin.Context) (*model.Inter
 	}
 
 	inAdapter := inbound.Get(inboundType)
-	internalRequest, err := inAdapter.TransformRequest(c.Request.Context(), body)
+	ctx := c.Request.Context()
+	if inboundType == inbound.InboundTypeOpenAIResponseCompact {
+		ctx = context.WithValue(ctx, openaiInbound.ResponseVariantContextKey{}, "compact")
+	}
+	internalRequest, err := inAdapter.TransformRequest(ctx, body)
 	if err != nil {
-		resp.Error(c, http.StatusInternalServerError, err.Error())
+		statusCode := http.StatusInternalServerError
+		if inboundType == inbound.InboundTypeOpenAIResponseCompact {
+			statusCode = http.StatusBadRequest
+		}
+		resp.Error(c, statusCode, err.Error())
 		return nil, nil, err
 	}
 
@@ -271,6 +339,19 @@ func (ra *relayAttempt) forward() (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("failed to read response body: %w", err)
 		}
+		// compact 请求：上游客户端输入错误（422 或包含 invalid 关键字的 400）直接透传，不换通道重试
+		if ra.internalRequest.IsResponseCompactRequest() && response.StatusCode >= 400 && response.StatusCode < 500 {
+			if response.StatusCode == http.StatusUnprocessableEntity ||
+				(response.StatusCode == http.StatusBadRequest && isClientInputError(string(body))) {
+				ra.copyResponseHeaders(response.Header)
+				contentType := response.Header.Get("Content-Type")
+				if contentType == "" {
+					contentType = "application/json"
+				}
+				ra.c.Data(response.StatusCode, contentType, body)
+				return response.StatusCode, ErrClientInputError
+			}
+		}
 		return 0, fmt.Errorf("upstream error: %d: %s", response.StatusCode, string(body))
 	}
 
@@ -300,6 +381,21 @@ func (ra *relayAttempt) copyHeaders(outboundRequest *http.Request) {
 	if len(ra.channel.CustomHeader) > 0 {
 		for _, header := range ra.channel.CustomHeader {
 			outboundRequest.Header.Set(header.HeaderKey, header.HeaderValue)
+		}
+	}
+}
+
+// copyResponseHeaders 复制响应头到客户端，过滤 hop-by-hop 头，保留关键头如 Retry-After
+func (ra *relayAttempt) copyResponseHeaders(respHeader http.Header) {
+	for key, values := range respHeader {
+		if hopByHopResponseHeaders[strings.ToLower(key)] {
+			continue
+		}
+		// 直接操作底层 Header 以保留多值头
+		header := ra.c.Writer.Header()
+		header.Del(key)
+		for _, value := range values {
+			header.Add(key, value)
 		}
 	}
 }
@@ -431,6 +527,10 @@ func (ra *relayAttempt) transformStreamData(ctx context.Context, data string) ([
 
 // handleResponse 处理非流式响应
 func (ra *relayAttempt) handleResponse(ctx context.Context, response *http.Response) error {
+	if ra.internalRequest.IsResponseCompactRequest() {
+		return ra.handleCompactResponse(response)
+	}
+
 	internalResponse, err := ra.outAdapter.TransformResponse(ctx, response)
 	if err != nil {
 		log.Warnf("failed to transform response: %v", err)
@@ -441,6 +541,27 @@ func (ra *relayAttempt) handleResponse(ctx context.Context, response *http.Respo
 	if err != nil {
 		log.Warnf("failed to transform response: %v", err)
 		return fmt.Errorf("failed to transform inbound response: %w", err)
+	}
+
+	ra.c.Data(http.StatusOK, "application/json", inResponse)
+	return nil
+}
+
+func (ra *relayAttempt) handleCompactResponse(response *http.Response) error {
+	// 透传上游响应头（含限流、缓存、请求跟踪等语义头）
+	ra.copyResponseHeaders(response.Header)
+
+	// 复用标准出站转换链路：outbound 解析响应并设置 RawResponse，inbound 原样透传
+	internalResponse, err := ra.outAdapter.TransformResponse(ra.c.Request.Context(), response)
+	if err != nil {
+		log.Warnf("failed to transform compact response: %v", err)
+		return fmt.Errorf("failed to transform outbound compact response: %w", err)
+	}
+
+	inResponse, err := ra.inAdapter.TransformResponse(ra.c.Request.Context(), internalResponse)
+	if err != nil {
+		log.Warnf("failed to transform compact inbound response: %v", err)
+		return fmt.Errorf("failed to transform inbound compact response: %w", err)
 	}
 
 	ra.c.Data(http.StatusOK, "application/json", inResponse)

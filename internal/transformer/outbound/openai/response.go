@@ -28,6 +28,10 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 		return nil, fmt.Errorf("request is nil")
 	}
 
+	if request.IsResponseCompactRequest() {
+		return o.transformCompactRequest(ctx, request, baseUrl, key)
+	}
+
 	// Convert to Responses API request format
 	responsesReq := ConvertToResponsesRequest(request)
 
@@ -54,6 +58,41 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 	parsedUrl.Path = parsedUrl.Path + "/responses"
 	req.URL = parsedUrl
 	req.Method = http.MethodPost
+
+	return req, nil
+}
+
+func (o *ResponseOutbound) transformCompactRequest(ctx context.Context, request *model.InternalLLMRequest, baseUrl, key string) (*http.Request, error) {
+	if len(request.RawRequest) == 0 {
+		return nil, fmt.Errorf("compact request raw body is empty")
+	}
+
+	body := append([]byte(nil), request.RawRequest...)
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal compact request: %w", err)
+	}
+	payload["model"] = request.Model
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compact request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create compact request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	parsedURL, err := url.Parse(strings.TrimSuffix(baseUrl, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse base url: %w", err)
+	}
+	parsedURL.Path = parsedURL.Path + "/responses/compact"
+	req.URL = parsedURL
 
 	return req, nil
 }
@@ -92,7 +131,11 @@ func (o *ResponseOutbound) TransformResponse(ctx context.Context, response *http
 	}
 
 	// Convert to internal response
-	return convertToLLMResponseFromResponses(&resp), nil
+	internalResp := convertToLLMResponseFromResponses(&resp)
+	if resp.Object == "response.compaction" {
+		internalResp.RawResponse = append([]byte(nil), body...)
+	}
+	return internalResp, nil
 }
 
 func (o *ResponseOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {

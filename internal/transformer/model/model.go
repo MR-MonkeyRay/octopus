@@ -253,6 +253,10 @@ func (r *InternalLLMRequest) Validate() error {
 		return errors.New("model is required")
 	}
 
+	if r.IsResponseCompactRequest() {
+		return nil
+	}
+
 	// 检查是否是 embedding 请求
 	isEmbeddingRequest := r.EmbeddingInput != nil
 	isChatRequest := len(r.Messages) > 0
@@ -378,6 +382,10 @@ func (r *InternalLLMRequest) IsEmbeddingRequest() bool {
 	return r.EmbeddingInput != nil
 }
 
+func (r *InternalLLMRequest) IsResponseCompactRequest() bool {
+	return r.HasTransformerMetadata("openai_responses_variant", "compact")
+}
+
 // IsChatRequest returns true if this is a chat completion request.
 func (r *InternalLLMRequest) IsChatRequest() bool {
 	return len(r.Messages) > 0
@@ -400,6 +408,13 @@ func (r *InternalLLMRequest) IsImageGenerationRequest() bool {
 type TransformOptions struct {
 	// ArrayInputs specifies whether the original input was an array.
 	ArrayInputs *bool `json:"-"`
+}
+
+func (r *InternalLLMRequest) HasTransformerMetadata(key, value string) bool {
+	if r == nil || len(r.TransformerMetadata) == 0 {
+		return false
+	}
+	return r.TransformerMetadata[key] == value
 }
 
 type StreamOptions struct {
@@ -665,6 +680,9 @@ type InternalLLMResponse struct {
 
 	// Error is the error information, will present if request to llm service failed with status >= 400.
 	Error *ResponseError `json:"error,omitempty"`
+
+	// RawResponse stores the original upstream body for passthrough-oriented adapters.
+	RawResponse []byte `json:"-"`
 }
 
 func (r *InternalLLMResponse) ClearHelpFields() {

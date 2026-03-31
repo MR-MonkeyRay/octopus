@@ -51,7 +51,13 @@ type ResponseInbound struct {
 	storedResponse *model.InternalLLMResponse
 }
 
+type ResponseVariantContextKey struct{}
+
 func (i *ResponseInbound) TransformRequest(ctx context.Context, body []byte) (*model.InternalLLMRequest, error) {
+	if isCompactRequest(ctx) {
+		return transformCompactRequest(body)
+	}
+
 	var req ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("failed to decode responses api request: %w", err)
@@ -64,6 +70,40 @@ func (i *ResponseInbound) TransformRequest(ctx context.Context, body []byte) (*m
 	return convertToInternalRequest(&req)
 }
 
+func isCompactRequest(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	requestPath, _ := ctx.Value(ResponseVariantContextKey{}).(string)
+	return requestPath == "compact"
+}
+
+func transformCompactRequest(body []byte) (*model.InternalLLMRequest, error) {
+	var req struct {
+		Model  string `json:"model"`
+		Stream *bool  `json:"stream,omitempty"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, fmt.Errorf("failed to decode responses compact request: %w", err)
+	}
+	if req.Model == "" {
+		return nil, fmt.Errorf("model is required")
+	}
+	if req.Stream != nil && *req.Stream {
+		return nil, fmt.Errorf("stream is not supported for responses compact")
+	}
+
+	return &model.InternalLLMRequest{
+		Model:             req.Model,
+		Stream:            req.Stream,
+		RawRequest:        append([]byte(nil), body...),
+		RawAPIFormat:      model.APIFormatOpenAIResponse,
+		TransformerMetadata: map[string]string{
+			"openai_responses_variant": "compact",
+		},
+	}, nil
+}
+
 func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model.InternalLLMResponse) ([]byte, error) {
 	if response == nil {
 		return nil, fmt.Errorf("response is nil")
@@ -71,6 +111,10 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 
 	// Store the response for later retrieval
 	i.storedResponse = response
+
+	if response.Object == "response.compaction" && len(response.RawResponse) > 0 {
+		return append([]byte(nil), response.RawResponse...), nil
+	}
 
 	// Convert to Responses API format
 	resp := convertToResponsesAPIResponse(response)

@@ -38,6 +38,16 @@ func IsEmbeddingChannelType(channelType OutboundType) bool {
 	return EmbeddingChannelTypes[channelType]
 }
 
+// CompactChannelTypes 定义支持 compact 请求的 channel 类型集合
+var CompactChannelTypes = map[OutboundType]bool{
+	OutboundTypeOpenAIResponse: true,
+}
+
+// IsCompactChannelType 判断 channel 类型是否支持 responses compact 请求
+func IsCompactChannelType(channelType OutboundType) bool {
+	return CompactChannelTypes[channelType]
+}
+
 // IsChatChannelType 判断 channel 类型是否支持 chat 请求
 func IsChatChannelType(channelType OutboundType) bool {
 	return ChatChannelTypes[channelType]
